@@ -1,0 +1,22 @@
+# Synthetic data output
+_output_stones/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/
+
+# Lock files
+.~lock.*
+
+# OS
+Thumbs.db
+.DS_Store
