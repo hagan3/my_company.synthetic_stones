@@ -412,16 +412,17 @@ class stoneUpdateExtension(omni.ext.IExt):
                     if prim_path in self._stone_translate_ops:
                         self._stone_translate_ops[prim_path].Set(pos)
                     else:
+                        # Clear the entire xform stack so that the translate
+                        # op is the ONLY transform.  Without this, any
+                        # pre-existing ops (e.g. a TypeTransform matrix from
+                        # the original scene) would compose with our
+                        # translate, causing the rendered position to differ
+                        # from what the label projects.
                         xform = UsdGeom.Xformable(prim)
-                        for op in xform.GetOrderedXformOps():
-                            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                                self._stone_translate_ops[prim_path] = op
-                                op.Set(pos)
-                                break
-                        else:
-                            op = xform.AddTranslateOp()
-                            op.Set(pos)
-                            self._stone_translate_ops[prim_path] = op
+                        xform.ClearXformOpOrder()
+                        op = xform.AddTranslateOp()
+                        op.Set(pos)
+                        self._stone_translate_ops[prim_path] = op
                 else:
                     # Could not place without collision, hide this stone
                     carb.log_warn(f"Could not place stone {prim.GetName()} after {MAX_PLACEMENT_ATTEMPTS} attempts, hiding.")
@@ -655,6 +656,14 @@ class stoneUpdateExtension(omni.ext.IExt):
                 sys_.append((1.0 - (focal_length * cam_pt[1]) / (half_v * d)) * 0.5)
 
             if len(sxs) < 2:
+                return
+
+            # Require the projected center to be within frame (unclipped)
+            # to avoid phantom labels for off-screen stones whose clipped
+            # bbox produces a sliver at the frame edge.
+            raw_cx = sum(sxs) / len(sxs)
+            raw_cy = sum(sys_) / len(sys_)
+            if not (0.0 <= raw_cx <= 1.0 and 0.0 <= raw_cy <= 1.0):
                 return
 
             x_min = max(0.0, min(sxs))
