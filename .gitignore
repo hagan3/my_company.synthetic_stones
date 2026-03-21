@@ -17,6 +17,9 @@ __pycache__/
 # Lock files
 .~lock.*
 
+# Annotation tool
+X-AnyLabeling/
+
 # OS
 Thumbs.db
 .DS_Store

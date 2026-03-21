@@ -32,21 +32,18 @@ USD_ORIGIN_Z = 36.5
 MIN_STONE_DISTANCE = 30.0
 MIN_STONE_DISTANCE_SQ = MIN_STONE_DISTANCE * MIN_STONE_DISTANCE
 MAX_PLACEMENT_ATTEMPTS = 50
-STONE_RADIUS = 15.0  # Approximate stone radius in cm
+STONE_RADIUS = 15.0  # Fixed physical radius in cm (~29 cm diameter curling stone)
+
+# Render product resolution (must match render_product creation in _setup_graph)
+RENDER_WIDTH = 640
+RENDER_HEIGHT = 640
 
 # Performance: set True to enable per-stone/per-frame print() logging
 DEBUG_LOGGING = False
 
-# House rings and hog line world-space offsets (relative to USD_ORIGIN_X/Y)
-HOUSE_CENTER_OFFSET_X = 0.0    # House rings centered at (0,0) offset
-HOUSE_CENTER_OFFSET_Y = 0.0
-HOUSE_ASSET_RADIUS = 183.0     # Full house asset extent (includes dark branding area)
-HOUSE_RINGS_RADIUS = 91.5     # 12-ft scoring rings only (~50% of asset, excludes branding)
-
-HOG_LINE_OFFSET_X = -640.0     # Hog line centered at (-640, 0) offset
-HOG_LINE_OFFSET_Y = 0.0
-HOG_LINE_HALF_WIDTH = 183.0    # Approximate half-width (same as house width)
-HOG_LINE_HALF_HEIGHT = 5.0     # Hog line is a thin strip
+# Prim paths for scene objects that need bounding box labels
+HOG_LINE_PRIM_PATH = "/World/hd_rings/hog_line/fp_logo_plane"
+HOUSE_RINGS_PRIM_PATH = "/World/hd_rings/gsoc_rings/fp_logo_plane"
 
 # Class IDs (matching generate_synthetic_data.py)
 CLASS_RED = 0
@@ -90,14 +87,21 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         # Calculate absolute output path
         self._output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "_output_stones"))
+        self._images_dir = os.path.join(self._output_dir, "images")
+        self._labels_dir = os.path.join(self._output_dir, "labels")
         print(f"Output Directory: {self._output_dir}")
         carb.log_info(f"Output Directory: {self._output_dir}")
 
+        # Ensure subdirectories exist
+        os.makedirs(self._images_dir, exist_ok=True)
+        os.makedirs(self._labels_dir, exist_ok=True)
+
         # Clear previous output data
-        if os.path.exists(self._output_dir):
-            for f in glob.glob(os.path.join(self._output_dir, "*.png")) + glob.glob(os.path.join(self._output_dir, "*.txt")):
-                os.remove(f)
-            carb.log_info(f"Cleared previous output from {self._output_dir}")
+        for d in [self._images_dir, self._labels_dir]:
+            if os.path.exists(d):
+                for f in glob.glob(os.path.join(d, "*")):
+                    os.remove(f)
+        carb.log_info(f"Cleared previous output from {self._output_dir}")
 
         self._frame_counter = 0
         self._is_running = True
@@ -115,7 +119,19 @@ class stoneUpdateExtension(omni.ext.IExt):
         # 1. Setup Graph (Camera, Writer)
         self._setup_graph()
 
-        # 2. Loop
+        # 2. Warm-up: prime the render pipeline so the first real frame
+        #    is fully synchronised.  The writer may produce an image here
+        #    (e.g. rgb_0000.png) which shifts its internal counter.
+        await rep.orchestrator.step_async()
+        await omni.kit.app.get_app().next_update_async()
+
+        # Detect how many images the setup / warm-up produced so we can
+        # start our label numbering at the same offset.
+        warmup_images = glob.glob(os.path.join(self._images_dir, "rgb_*.png"))
+        label_start = len(warmup_images)
+        carb.log_info(f"Warm-up produced {label_start} image(s); labels will start at index {label_start}")
+
+        # 3. Generation loop
         num_images = self._image_count_model.get_value_as_int()
         carb.log_info(f"Generating {num_images} images...")
         print(f"Generating {num_images} images...")
@@ -126,20 +142,31 @@ class stoneUpdateExtension(omni.ext.IExt):
             # Randomize (Synchronous Python Update)
             self._randomize_stones_per_frame()
 
+            # Flush USD attribute changes to the renderer so the capture
+            # reflects the scene we just randomised (without this, the
+            # renderer may still see the *previous* frame's state, causing
+            # an off-by-one between images and labels).
+            await omni.kit.app.get_app().next_update_async()
+
             # Step Replicator (Render one frame)
-            # This pushes the current USD state to the writer(s)
             await rep.orchestrator.step_async()
 
-            # Write YOLO ground truth labels for this frame
-            self._write_yolo_labels(i)
+            # Write YOLO labels with an index that matches the writer's
+            # file counter (offset by any warm-up frames).
+            frame_id = label_start + i
+            self._write_yolo_labels(frame_id)
 
             if DEBUG_LOGGING:
-                print(f"Image Generated: rgb_{i:04d}.png")
-            carb.log_info(f"Generated rgb_{i:04d}.png")
+                print(f"Image Generated: rgb_{frame_id:04d}.png")
+            carb.log_info(f"Generated rgb_{frame_id:04d}.png")
 
-            # Yield to UI loop every 10 frames to keep interface responsive
-            if i % 10 == 0:
-                await omni.kit.app.get_app().next_update_async()
+        # Remove warm-up images that have no matching labels
+        for f in warmup_images:
+            try:
+                os.remove(f)
+                carb.log_info(f"Removed warm-up image: {f}")
+            except OSError:
+                pass
 
         carb.log_info("Generation Finished.")
 
@@ -192,12 +219,16 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         # 3. Writer
         # Initialize the BasicWriter to save RGB images
+        render_product = rep.create.render_product(camera, (RENDER_WIDTH, RENDER_HEIGHT))
         writer = rep.WriterRegistry.get("BasicWriter")
         writer.initialize(
-            output_dir=self._output_dir,
+            output_dir=self._images_dir,
             rgb=True
         )
-        writer.attach([rep.create.render_product(camera, (640, 640))])
+        writer.attach([render_product])
+
+        # 4. Semantic labels on prims (documents class mapping, useful for annotators)
+        self._setup_semantic_labels(stage)
 
         # Cache camera prim references to avoid stage.Traverse() every frame
         self._camera_xform_prim = None
@@ -216,14 +247,71 @@ class stoneUpdateExtension(omni.ext.IExt):
         settings.set_int("/rtx/post/aa/op", 2)  # TAA Enabled
         settings.set_int("/rtx/materialDb/anisotropy", 16)  # Sharp textures at angles
         settings.set_int("/rtx/raytracing/subsurface/maxSamplePerFrame", 3)
-        settings.set_int("/rtx/hydra/Tessellation/maxSubdivisionLevel", 4)  # GPU subdivides triangles up to 4 times
-        settings.set_bool("/rtx/hydra/Tessellation/adaptiveTessellation", False)  # Force high detail everywhere
+
+        # Subdivision & Tessellation — ensure Catmull-Clark subdivision
+        # actually runs in the RTX render product (not just the viewport).
+        # The viewport's smooth appearance comes from the Storm renderer
+        # honouring refinementLevel, but RTX needs these explicit settings.
+        settings.set_bool("/rtx/hydra/subdivision/enabled", True)
+        settings.set_int("/rtx/hydra/subdivision/refinementLevel", 1)
+        settings.set_bool("/rtx/hydra/Tessellation/enabled", True)
+        settings.set_int("/rtx/hydra/Tessellation/maxSubdivisionLevel", 2)
+        settings.set_bool("/rtx/hydra/Tessellation/adaptiveTessellation", True)
+        settings.set_bool("/rtx/hydra/faceCulling/enabled", False)
+
+        # Ensure RTX Real-Time render mode (matches viewport)
+        settings.set_string("/rtx/rendermode", "RaytracedLighting")
 
         # Set Catmull-Clark subdivision on all stone meshes for smoother rendering
         self._apply_subdivision_to_stones(stage)
 
         # Cache stone translate ops to avoid searching xform ops every frame
         self._stone_translate_ops = {}
+
+    def _setup_semantic_labels(self, stage):
+        """Add semantic class labels to prims so the bbox annotator can identify them."""
+        from pxr import Sdf
+
+        def _add_label(prim, label):
+            prim.CreateAttribute(
+                "semantics:Semantics:params:semanticType",
+                Sdf.ValueTypeNames.String
+            ).Set("class")
+            prim.CreateAttribute(
+                "semantics:Semantics:params:semanticData",
+                Sdf.ValueTypeNames.String
+            ).Set(label)
+
+        # Stone prims — classify by name
+        stones_prim = stage.GetPrimAtPath("/World/Stones")
+        if stones_prim.IsValid():
+            for prim in stones_prim.GetChildren():
+                if not prim.IsValid():
+                    continue
+                name_lower = prim.GetName().lower()
+                if '_r' in name_lower or 'red' in name_lower:
+                    _add_label(prim, "red_stone")
+                elif '_y' in name_lower or 'yellow' in name_lower:
+                    _add_label(prim, "yellow_stone")
+                else:
+                    _add_label(prim, "red_stone")
+            carb.log_info(f"Labelled {len(list(stones_prim.GetChildren()))} stone prims")
+
+        # Hog line mesh
+        hog_prim = stage.GetPrimAtPath(HOG_LINE_PRIM_PATH)
+        if hog_prim.IsValid():
+            _add_label(hog_prim, "hog_line")
+            carb.log_info(f"Labelled hog line: {HOG_LINE_PRIM_PATH}")
+        else:
+            carb.log_warn(f"Hog line prim not found: {HOG_LINE_PRIM_PATH}")
+
+        # House rings mesh
+        house_prim = stage.GetPrimAtPath(HOUSE_RINGS_PRIM_PATH)
+        if house_prim.IsValid():
+            _add_label(house_prim, "house")
+            carb.log_info(f"Labelled house rings: {HOUSE_RINGS_PRIM_PATH}")
+        else:
+            carb.log_warn(f"House rings prim not found: {HOUSE_RINGS_PRIM_PATH}")
 
     def _apply_subdivision_to_stones(self, stage):
         """Set Catmull-Clark subdivision scheme and refinement level 3 on all stone meshes."""
@@ -241,11 +329,11 @@ class stoneUpdateExtension(omni.ext.IExt):
                 if not refinement_attr or not refinement_attr.IsValid():
                     from pxr import Sdf
                     refinement_attr = prim.CreateAttribute("refinementLevel", Sdf.ValueTypeNames.Int)
-                refinement_attr.Set(3)
+                refinement_attr.Set(1)
                 count += 1
 
-        carb.log_info(f"Applied Catmull-Clark subdivision (refinement=3) to {count} stone meshes")
-        print(f"Applied Catmull-Clark subdivision (refinement=3) to {count} stone meshes")
+        carb.log_info(f"Applied Catmull-Clark subdivision (refinement=1) to {count} stone meshes")
+        print(f"Applied Catmull-Clark subdivision (refinement=1) to {count} stone meshes")
 
     def _randomize_stones_per_frame(self):
         """
@@ -255,7 +343,7 @@ class stoneUpdateExtension(omni.ext.IExt):
         """
         self._frame_counter += 1
         if DEBUG_LOGGING:
-            current_file = os.path.join(self._output_dir, f"rgb_{self._frame_counter:04d}.png")
+            current_file = os.path.join(self._images_dir, f"rgb_{self._frame_counter:04d}.png")
             print(f"Generating Frame {self._frame_counter}: {current_file}")
             carb.log_info(f"Generating Frame {self._frame_counter}: {current_file}")
 
@@ -288,7 +376,6 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         # 3. Apply Visibility & Position with Collision Avoidance
         placed_positions = []  # Track placed stone positions for collision check
-        self._current_frame_stones = []  # Track stone data for YOLO labels
 
         for prim in all_stones:
             imageable = UsdGeom.Imageable(prim)
@@ -310,14 +397,6 @@ class stoneUpdateExtension(omni.ext.IExt):
 
                     if DEBUG_LOGGING:
                         carb.log_info(f"Stone {prim.GetName()} -> Pos: ({rand_x:.2f}, {rand_y:.2f})")
-
-                    # Store for YOLO label generation
-                    self._current_frame_stones.append({
-                        'name': prim.GetName(),
-                        'x': rand_x,
-                        'y': rand_y,
-                        'z': USD_ORIGIN_Z
-                    })
 
                     # Set Translation (use cached op when available)
                     pos = Gf.Vec3d(rand_x, rand_y, USD_ORIGIN_Z)
@@ -375,6 +454,10 @@ class stoneUpdateExtension(omni.ext.IExt):
             view_mtx.SetLookAt(cam_pos, target_pos, up_vec)
             xform_mtx = view_mtx.GetInverse()
 
+            # Store for label projection — this is the exact matrix used
+            # to position the camera, so labels will match the render.
+            self._view_matrix = view_mtx
+
             xform = UsdGeom.Xformable(camera_xform_prim)
             self._set_transform_matrix(xform, xform_mtx)
 
@@ -425,102 +508,184 @@ class stoneUpdateExtension(omni.ext.IExt):
 
     def _write_yolo_labels(self, frame_index):
         """Write YOLO format label file for the current frame.
-        Format: class_id center_x center_y width height (all normalized 0-1)
-        Class 0 = red stone, Class 1 = yellow stone, Class 2 = hog line, Class 3 = house rings"""
-        label_path = os.path.join(self._output_dir, f"rgb_{frame_index:04d}.txt")
+        Uses UsdGeom.BBoxCache for actual prim geometry bounds and the stored
+        view matrix from _randomize_stones_per_frame for camera projection.
+        Format: class_id center_x center_y width height (all normalized 0-1)"""
+        label_path = os.path.join(self._labels_dir, f"rgb_{frame_index:04d}.txt")
 
         stage = omni.usd.get_context().get_stage()
         if not stage:
+            with open(label_path, 'w') as f:
+                f.write('')
             return
 
         camera_prim = self._camera_camera_prim
-
-        if not camera_prim:
+        if not camera_prim or not camera_prim.IsValid():
             carb.log_error("Cannot write YOLO labels: camera not found")
             return
 
-        # Get camera frustum for 3D-to-2D projection
-        usd_camera = UsdGeom.Camera(camera_prim)
-        gf_camera = usd_camera.GetCamera(Usd.TimeCode.Default())
-        frustum = gf_camera.frustum
+        time_code = Usd.TimeCode.Default()
 
-        view_matrix = frustum.ComputeViewMatrix()
-        proj_matrix = frustum.ComputeProjectionMatrix()
+        # --- View matrix: use the exact matrix we computed to position the camera ---
+        # Reading back from USD via XformCache can return stale data if
+        # step_async() hasn't flushed yet, or post-step Replicator graph
+        # evaluation overwrites the transform.
+        if not hasattr(self, '_view_matrix') or self._view_matrix is None:
+            carb.log_error("Cannot write YOLO labels: no view matrix stored")
+            return
+        view_matrix = self._view_matrix
+
+        # --- Camera intrinsics ---
+        usd_camera = UsdGeom.Camera(camera_prim)
+        focal_length = usd_camera.GetFocalLengthAttr().Get()
+        h_aperture = usd_camera.GetHorizontalApertureAttr().Get()
+
+        if not focal_length or not h_aperture:
+            carb.log_error("Cannot write YOLO labels: missing camera intrinsics")
+            return
+
+        # Effective v_aperture: the renderer overrides the USD attribute to
+        # match the render product's aspect ratio.
+        v_aperture = h_aperture * (RENDER_HEIGHT / RENDER_WIDTH)
+        half_h = h_aperture * 0.5
+        half_v = v_aperture * 0.5
+
+        # --- BBoxCache for actual mesh geometry ---
+        bbox_cache = UsdGeom.BBoxCache(time_code, ['default', 'render'])
 
         lines = []
 
-        # --- Helper: project a 3D point to normalized image coords ---
-        def project_to_norm(world_pt):
-            view_pt = view_matrix.Transform(world_pt)
-            ndc_pt = proj_matrix.Transform(view_pt)
-            cx = (ndc_pt[0] + 1.0) / 2.0
-            cy = 1.0 - (ndc_pt[1] + 1.0) / 2.0
-            return cx, cy
+        def _project_prim_bbox(prim, class_id):
+            """Compute world-space bbox for a prim, project 8 corners to screen
+            space, and append a YOLO label line."""
+            imageable = UsdGeom.Imageable(prim)
+            if imageable.ComputeVisibility(time_code) == UsdGeom.Tokens.invisible:
+                return
 
-        # --- Helper: write a bbox label from center + half-extents ---
-        # Projects all 4 corners for correct perspective (angled views make ellipses)
-        # and clips the bbox to frame bounds when partially off-screen
-        def write_bbox_label(class_id, cx_world, cy_world, cz_world, half_w, half_h):
-            corners = [
-                Gf.Vec3d(cx_world - half_w, cy_world - half_h, cz_world),
-                Gf.Vec3d(cx_world + half_w, cy_world - half_h, cz_world),
-                Gf.Vec3d(cx_world + half_w, cy_world + half_h, cz_world),
-                Gf.Vec3d(cx_world - half_w, cy_world + half_h, cz_world),
-            ]
+            world_bbox = bbox_cache.ComputeWorldBound(prim)
+            aligned = world_bbox.ComputeAlignedRange()
+            if aligned.IsEmpty():
+                return
 
-            xs, ys = [], []
-            for corner in corners:
-                nx, ny = project_to_norm(corner)
-                xs.append(nx)
-                ys.append(ny)
+            bmin = aligned.GetMin()
+            bmax = aligned.GetMax()
 
-            # Unclipped bbox extents
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
+            # Project all 8 corners of the 3D AABB to normalized screen coords
+            sxs, sys_ = [], []
+            for xi in (0, 1):
+                for yi in (0, 1):
+                    for zi in (0, 1):
+                        wx = bmax[0] if xi else bmin[0]
+                        wy = bmax[1] if yi else bmin[1]
+                        wz = bmax[2] if zi else bmin[2]
 
-            # Clip to frame bounds [0, 1]
-            x_min = max(0.0, x_min)
-            y_min = max(0.0, y_min)
-            x_max = min(1.0, x_max)
-            y_max = min(1.0, y_max)
+                        cam_pt = view_matrix.Transform(Gf.Vec3d(wx, wy, wz))
 
-            # Skip if fully outside frame or degenerate
+                        if cam_pt[2] >= 0:  # behind camera (looks down -Z)
+                            continue
+
+                        depth = -cam_pt[2]
+                        ndc_x = (focal_length * cam_pt[0]) / (half_h * depth)
+                        ndc_y = (focal_length * cam_pt[1]) / (half_v * depth)
+
+                        sxs.append((ndc_x + 1.0) * 0.5)
+                        sys_.append((1.0 - ndc_y) * 0.5)
+
+            if not sxs:
+                return
+
+            # Screen-space AABB, clipped to [0, 1]
+            x_min = max(0.0, min(sxs))
+            y_min = max(0.0, min(sys_))
+            x_max = min(1.0, max(sxs))
+            y_max = min(1.0, max(sys_))
+
             if x_max <= x_min or y_max <= y_min:
                 return
 
-            # YOLO format: center_x, center_y, width, height (all normalized)
             w_norm = x_max - x_min
             h_norm = y_max - y_min
             cx_norm = (x_min + x_max) / 2.0
             cy_norm = (y_min + y_max) / 2.0
 
+            if w_norm < 0.005 or h_norm < 0.005:
+                return
+
             lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
 
-        # --- House Rings ---
-        house_x = USD_ORIGIN_X + HOUSE_CENTER_OFFSET_X
-        house_y = USD_ORIGIN_Y + HOUSE_CENTER_OFFSET_Y
-        write_bbox_label(CLASS_HOUSE, house_x, house_y, USD_ORIGIN_Z, HOUSE_RINGS_RADIUS, HOUSE_RINGS_RADIUS)
+        # --- Stones (fixed-radius projection for consistent bounding boxes) ---
+        # All curling stones are the same physical size, so use a fixed radius
+        # instead of BBoxCache which varies with mesh detail and rotation.
+        def _project_stone(prim, class_id):
+            imageable = UsdGeom.Imageable(prim)
+            if imageable.ComputeVisibility(time_code) == UsdGeom.Tokens.invisible:
+                return
+
+            # Read the stone's world position from its translate op
+            xformable = UsdGeom.Xformable(prim)
+            world_pos = None
+            for op in xformable.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                    world_pos = op.Get()
+                    break
+            if world_pos is None:
+                return
+
+            # Project 8 points around the stone's rim plus center.
+            # This produces a tight bbox even when the camera is tilted,
+            # where a circular stone projects as an ellipse.
+            wx, wy, wz = world_pos[0], world_pos[1], world_pos[2]
+            sxs, sys_ = [], []
+            for k in range(8):
+                angle = k * math.pi / 4.0
+                rx = wx + STONE_RADIUS * math.cos(angle)
+                ry = wy + STONE_RADIUS * math.sin(angle)
+                cam_pt = view_matrix.Transform(Gf.Vec3d(rx, ry, wz))
+                if cam_pt[2] >= 0:
+                    continue
+                d = -cam_pt[2]
+                sxs.append(((focal_length * cam_pt[0]) / (half_h * d) + 1.0) * 0.5)
+                sys_.append((1.0 - (focal_length * cam_pt[1]) / (half_v * d)) * 0.5)
+
+            if len(sxs) < 2:
+                return
+
+            x_min = max(0.0, min(sxs))
+            y_min = max(0.0, min(sys_))
+            x_max = min(1.0, max(sxs))
+            y_max = min(1.0, max(sys_))
+
+            if x_max <= x_min or y_max <= y_min:
+                return
+
+            w_norm = x_max - x_min
+            h_norm = y_max - y_min
+            cx_norm = (x_min + x_max) / 2.0
+            cy_norm = (y_min + y_max) / 2.0
+
+            if w_norm < 0.005 or h_norm < 0.005:
+                return
+
+            lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
+
+        stones_prim = stage.GetPrimAtPath("/World/Stones")
+        if stones_prim.IsValid():
+            for prim in stones_prim.GetChildren():
+                if not prim.IsValid():
+                    continue
+                name_lower = prim.GetName().lower()
+                cls = CLASS_YELLOW if ('_y' in name_lower or 'yellow' in name_lower) else CLASS_RED
+                _project_stone(prim, cls)
 
         # --- Hog Line ---
-        hog_x = USD_ORIGIN_X + HOG_LINE_OFFSET_X
-        hog_y = USD_ORIGIN_Y + HOG_LINE_OFFSET_Y
-        write_bbox_label(CLASS_HOG, hog_x, hog_y, USD_ORIGIN_Z, HOG_LINE_HALF_WIDTH, HOG_LINE_HALF_HEIGHT)
+        hog_prim = stage.GetPrimAtPath(HOG_LINE_PRIM_PATH)
+        if hog_prim.IsValid():
+            _project_prim_bbox(hog_prim, CLASS_HOG)
 
-        # --- Stones ---
-        if hasattr(self, '_current_frame_stones') and self._current_frame_stones:
-            for stone_data in self._current_frame_stones:
-                name = stone_data['name']
-                sx, sy, sz = stone_data['x'], stone_data['y'], stone_data['z']
-
-                name_lower = name.lower()
-                if '_r' in name_lower or 'red' in name_lower:
-                    class_id = CLASS_RED
-                elif '_y' in name_lower or 'yellow' in name_lower:
-                    class_id = CLASS_YELLOW
-                else:
-                    class_id = CLASS_RED
-
-                write_bbox_label(class_id, sx, sy, sz, STONE_RADIUS, STONE_RADIUS)
+        # --- House Rings ---
+        house_prim = stage.GetPrimAtPath(HOUSE_RINGS_PRIM_PATH)
+        if house_prim.IsValid():
+            _project_prim_bbox(house_prim, CLASS_HOUSE)
 
         with open(label_path, 'w') as f:
             f.write('\n'.join(lines))
