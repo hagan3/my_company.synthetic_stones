@@ -124,10 +124,6 @@ class stoneUpdateExtension(omni.ext.IExt):
         await rep.orchestrator.step_async()
         await omni.kit.app.get_app().next_update_async()
 
-        # First randomised frame — ensures camera adjustments, lighting,
-        # and stone positions have all been applied at least once before
-        # we start recording.  The writer may save this as an image, but
-        # it won't have a matching label so we discard it below.
         self._randomize_stones_per_frame()
         await omni.kit.app.get_app().next_update_async()
         await rep.orchestrator.step_async()
@@ -136,44 +132,67 @@ class stoneUpdateExtension(omni.ext.IExt):
         # start our label numbering at the same offset.
         warmup_images = glob.glob(os.path.join(self._images_dir, "rgb_*.png"))
         label_start = len(warmup_images)
-        carb.log_info(f"Warm-up produced {label_start} image(s); labels will start at index {label_start}")
+        carb.log_info(f"Warm-up produced {label_start} image(s)")
 
         # 3. Generation loop
+        #
+        # The Replicator render pipeline has a 1-frame delay: step_async()
+        # at time T writes the image that was *rendered* during step T-1.
+        # To keep labels in sync with images we capture each frame's label
+        # data immediately, then write it one step later — when the
+        # matching image is actually flushed to disk.
         num_images = self._image_count_model.get_value_as_int()
         carb.log_info(f"Generating {num_images} images...")
         print(f"Generating {num_images} images...")
+
+        pending_label = None  # (visible_objects, cam_params) awaiting image flush
+
         for i in range(num_images):
             if not self._is_running:
                 break
 
-            # Randomize (Synchronous Python Update)
             self._randomize_stones_per_frame()
-
-            # Flush USD attribute changes to the renderer so the capture
-            # reflects the scene we just randomised (without this, the
-            # renderer may still see the *previous* frame's state, causing
-            # an off-by-one between images and labels).
             await omni.kit.app.get_app().next_update_async()
 
-            # Step Replicator (Render one frame)
+            # Capture label data for this scene before stepping
+            current_label = (
+                list(self._frame_visible_objects),
+                self._get_camera_params(),
+            )
+
             await rep.orchestrator.step_async()
 
-            # Write YOLO labels with an index that matches the writer's
-            # file counter (offset by any warm-up frames).
-            frame_id = label_start + i
-            self._write_yolo_labels(frame_id)
+            # step just saved the PREVIOUS scene's render to disk.
+            # Write the matching label.
+            if pending_label is not None:
+                frame_id = label_start + i
+                prev_objects, prev_cam = pending_label
+                self._write_yolo_labels(frame_id, prev_objects, prev_cam)
+                if DEBUG_LOGGING:
+                    print(f"Image Generated: rgb_{frame_id:04d}.png")
+                carb.log_info(f"Generated rgb_{frame_id:04d}.png")
 
-            if DEBUG_LOGGING:
-                print(f"Image Generated: rgb_{frame_id:04d}.png")
+            pending_label = current_label
+
+        # One final step to flush the last frame's render to disk
+        if pending_label is not None and self._is_running:
+            await rep.orchestrator.step_async()
+            frame_id = label_start + num_images
+            prev_objects, prev_cam = pending_label
+            self._write_yolo_labels(frame_id, prev_objects, prev_cam)
             carb.log_info(f"Generated rgb_{frame_id:04d}.png")
 
-        # Remove warm-up images that have no matching labels
-        for f in warmup_images:
-            try:
-                os.remove(f)
-                carb.log_info(f"Removed warm-up image: {f}")
-            except OSError:
-                pass
+        # Remove all images that have no matching label file
+        labeled_bases = set()
+        for lf in glob.glob(os.path.join(self._labels_dir, "rgb_*.txt")):
+            labeled_bases.add(os.path.splitext(os.path.basename(lf))[0])
+        for img in glob.glob(os.path.join(self._images_dir, "rgb_*.png")):
+            if os.path.splitext(os.path.basename(img))[0] not in labeled_bases:
+                try:
+                    os.remove(img)
+                    carb.log_info(f"Removed unlabeled image: {img}")
+                except OSError:
+                    pass
 
         carb.log_info("Generation Finished.")
 
@@ -590,17 +609,16 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         return f"{class_id} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}"
 
-    def _write_yolo_labels(self, frame_index):
+    def _write_yolo_labels(self, frame_index, visible_objects, cam_params):
         """Write YOLO format labels by projecting known 3D object positions
         through the camera.
         Format: class_id center_x center_y width height (all normalized 0-1)"""
         label_path = os.path.join(self._labels_dir, f"rgb_{frame_index:04d}.txt")
 
-        cam_params = self._get_camera_params()
         lines = []
 
         # 1. Stones (positions tracked during randomization)
-        for class_id, wx, wy in self._frame_visible_objects:
+        for class_id, wx, wy in visible_objects:
             bbox_min = Gf.Vec3d(wx - STONE_RADIUS, wy - STONE_RADIUS, USD_ORIGIN_Z)
             bbox_max = Gf.Vec3d(wx + STONE_RADIUS, wy + STONE_RADIUS, USD_ORIGIN_Z + STONE_RADIUS)
             line = self._project_bbox_to_yolo(class_id, bbox_min, bbox_max, cam_params)
