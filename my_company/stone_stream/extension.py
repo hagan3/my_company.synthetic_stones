@@ -18,7 +18,6 @@ import carb
 import glob
 import os
 import random
-import shutil
 import omni.replicator.core as rep
 from pxr import UsdGeom, UsdLux, Gf, Usd
 import math
@@ -32,8 +31,6 @@ USD_ORIGIN_Z = 36.5
 MIN_STONE_DISTANCE = 30.0
 MIN_STONE_DISTANCE_SQ = MIN_STONE_DISTANCE * MIN_STONE_DISTANCE
 MAX_PLACEMENT_ATTEMPTS = 50
-STONE_RADIUS = 15.0  # Fixed physical radius in cm (~29 cm diameter curling stone)
-
 # Render product resolution (must match render_product creation in _setup_graph)
 RENDER_WIDTH = 640
 RENDER_HEIGHT = 640
@@ -225,7 +222,7 @@ class stoneUpdateExtension(omni.ext.IExt):
         xform.AddTranslateOp().Set(Gf.Vec3d(USD_ORIGIN_X - 200, USD_ORIGIN_Y + 100, USD_ORIGIN_Z + 500))
         carb.log_info("Created KeyLight at /World/KeyLight")
 
-        # 3. Writer
+        # 3. Writer + Annotator
         # Initialize the BasicWriter to save RGB images
         render_product = rep.create.render_product(camera, (RENDER_WIDTH, RENDER_HEIGHT))
         writer = rep.WriterRegistry.get("BasicWriter")
@@ -234,6 +231,12 @@ class stoneUpdateExtension(omni.ext.IExt):
             rgb=True
         )
         writer.attach([render_product])
+
+        # Attach bounding-box annotator for ground-truth labels.
+        # Uses the renderer's own visibility / projection so labels
+        # are guaranteed to match the captured image.
+        self._bbox_annotator = rep.annotator.get("bounding_box_2d_tight")
+        self._bbox_annotator.attach([render_product])
 
         # 4. Semantic labels on prims (documents class mapping, useful for annotators)
         self._setup_semantic_labels(stage)
@@ -462,10 +465,6 @@ class stoneUpdateExtension(omni.ext.IExt):
             view_mtx.SetLookAt(cam_pos, target_pos, up_vec)
             xform_mtx = view_mtx.GetInverse()
 
-            # Store for label projection — this is the exact matrix used
-            # to position the camera, so labels will match the render.
-            self._view_matrix = view_mtx
-
             xform = UsdGeom.Xformable(camera_xform_prim)
             self._set_transform_matrix(xform, xform_mtx)
 
@@ -514,191 +513,73 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         return None
 
+    # Mapping from semantic label strings to YOLO class IDs.
+    _SEMANTIC_TO_CLASS = {
+        "red_stone": CLASS_RED,
+        "yellow_stone": CLASS_YELLOW,
+        "hog_line": CLASS_HOG,
+        "house": CLASS_HOUSE,
+    }
+
     def _write_yolo_labels(self, frame_index):
-        """Write YOLO format label file for the current frame.
-        Uses UsdGeom.BBoxCache for actual prim geometry bounds and the stored
-        view matrix from _randomize_stones_per_frame for camera projection.
+        """Write YOLO format labels from Replicator's bounding_box_2d_tight
+        annotator.  Because the annotator reads directly from the renderer,
+        every bbox is guaranteed to correspond to a visible object in the
+        captured image — no manual projection or visibility guessing needed.
         Format: class_id center_x center_y width height (all normalized 0-1)"""
         label_path = os.path.join(self._labels_dir, f"rgb_{frame_index:04d}.txt")
 
-        stage = omni.usd.get_context().get_stage()
-        if not stage:
+        data = self._bbox_annotator.get_data()
+        if data is None:
             with open(label_path, 'w') as f:
                 f.write('')
             return
 
-        camera_prim = self._camera_camera_prim
-        if not camera_prim or not camera_prim.IsValid():
-            carb.log_error("Cannot write YOLO labels: camera not found")
-            return
-
-        time_code = Usd.TimeCode.Default()
-
-        # --- View matrix: use the exact matrix we computed to position the camera ---
-        # Reading back from USD via XformCache can return stale data if
-        # step_async() hasn't flushed yet, or post-step Replicator graph
-        # evaluation overwrites the transform.
-        if not hasattr(self, '_view_matrix') or self._view_matrix is None:
-            carb.log_error("Cannot write YOLO labels: no view matrix stored")
-            return
-        view_matrix = self._view_matrix
-
-        # --- Camera intrinsics ---
-        usd_camera = UsdGeom.Camera(camera_prim)
-        focal_length = usd_camera.GetFocalLengthAttr().Get()
-        h_aperture = usd_camera.GetHorizontalApertureAttr().Get()
-
-        if not focal_length or not h_aperture:
-            carb.log_error("Cannot write YOLO labels: missing camera intrinsics")
-            return
-
-        # Effective v_aperture: the renderer overrides the USD attribute to
-        # match the render product's aspect ratio.
-        v_aperture = h_aperture * (RENDER_HEIGHT / RENDER_WIDTH)
-        half_h = h_aperture * 0.5
-        half_v = v_aperture * 0.5
-
-        # --- BBoxCache for actual mesh geometry ---
-        bbox_cache = UsdGeom.BBoxCache(time_code, ['default', 'render'])
+        bbox_data = data.get("data")
+        id_to_labels = data.get("info", {}).get("idToLabels", {})
 
         lines = []
 
-        def _project_prim_bbox(prim, class_id):
-            """Compute world-space bbox for a prim, project 8 corners to screen
-            space, and append a YOLO label line."""
-            imageable = UsdGeom.Imageable(prim)
-            if imageable.ComputeVisibility(time_code) == UsdGeom.Tokens.invisible:
-                return
-            world_bbox = bbox_cache.ComputeWorldBound(prim)
-            aligned = world_bbox.ComputeAlignedRange()
-            if aligned.IsEmpty():
-                return
+        if bbox_data is not None and len(bbox_data) > 0:
+            for i in range(len(bbox_data)):
+                bbox = bbox_data[i]
+                # bbox is [x_min, y_min, x_max, y_max] in pixel coords
+                x_min = float(bbox[0])
+                y_min = float(bbox[1])
+                x_max = float(bbox[2])
+                y_max = float(bbox[3])
 
-            bmin = aligned.GetMin()
-            bmax = aligned.GetMax()
-
-            # Project all 8 corners of the 3D AABB to normalized screen coords
-            sxs, sys_ = [], []
-            for xi in (0, 1):
-                for yi in (0, 1):
-                    for zi in (0, 1):
-                        wx = bmax[0] if xi else bmin[0]
-                        wy = bmax[1] if yi else bmin[1]
-                        wz = bmax[2] if zi else bmin[2]
-
-                        cam_pt = view_matrix.Transform(Gf.Vec3d(wx, wy, wz))
-
-                        if cam_pt[2] >= 0:  # behind camera (looks down -Z)
-                            continue
-
-                        depth = -cam_pt[2]
-                        ndc_x = (focal_length * cam_pt[0]) / (half_h * depth)
-                        ndc_y = (focal_length * cam_pt[1]) / (half_v * depth)
-
-                        sxs.append((ndc_x + 1.0) * 0.5)
-                        sys_.append((1.0 - ndc_y) * 0.5)
-
-            if not sxs:
-                return
-
-            # Screen-space AABB, clipped to [0, 1]
-            x_min = max(0.0, min(sxs))
-            y_min = max(0.0, min(sys_))
-            x_max = min(1.0, max(sxs))
-            y_max = min(1.0, max(sys_))
-
-            if x_max <= x_min or y_max <= y_min:
-                return
-
-            w_norm = x_max - x_min
-            h_norm = y_max - y_min
-            cx_norm = (x_min + x_max) / 2.0
-            cy_norm = (y_min + y_max) / 2.0
-
-            if w_norm < 0.005 or h_norm < 0.005:
-                return
-
-            lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
-
-        # --- Stones (fixed-radius projection for consistent bounding boxes) ---
-        # All curling stones are the same physical size, so use a fixed radius
-        # instead of BBoxCache which varies with mesh detail and rotation.
-        xform_cache = UsdGeom.XformCache(time_code)
-
-        def _project_stone(prim, class_id):
-            imageable = UsdGeom.Imageable(prim)
-            if imageable.ComputeVisibility(time_code) == UsdGeom.Tokens.invisible:
-                return
-
-            # Use XformCache to get the actual composed world transform,
-            # which accounts for ALL xform ops (translate, rotate, scale,
-            # matrix) — not just the translate op we set.
-            world_mtx = xform_cache.GetLocalToWorldTransform(prim)
-            world_pos = world_mtx.ExtractTranslation()
-
-            # Project 8 points around the stone's rim plus center.
-            # This produces a tight bbox even when the camera is tilted,
-            # where a circular stone projects as an ellipse.
-            wx, wy, wz = world_pos[0], world_pos[1], world_pos[2]
-            sxs, sys_ = [], []
-            for k in range(8):
-                angle = k * math.pi / 4.0
-                rx = wx + STONE_RADIUS * math.cos(angle)
-                ry = wy + STONE_RADIUS * math.sin(angle)
-                cam_pt = view_matrix.Transform(Gf.Vec3d(rx, ry, wz))
-                if cam_pt[2] >= 0:
+                # Skip degenerate / empty boxes
+                if x_max <= x_min or y_max <= y_min:
                     continue
-                d = -cam_pt[2]
-                sxs.append(((focal_length * cam_pt[0]) / (half_h * d) + 1.0) * 0.5)
-                sys_.append((1.0 - (focal_length * cam_pt[1]) / (half_v * d)) * 0.5)
 
-            if len(sxs) < 2:
-                return
+                # Normalize to [0, 1]
+                x_min_n = x_min / RENDER_WIDTH
+                y_min_n = y_min / RENDER_HEIGHT
+                x_max_n = x_max / RENDER_WIDTH
+                y_max_n = y_max / RENDER_HEIGHT
 
-            # Require the projected center to be within frame (unclipped)
-            # to avoid phantom labels for off-screen stones whose clipped
-            # bbox produces a sliver at the frame edge.
-            raw_cx = sum(sxs) / len(sxs)
-            raw_cy = sum(sys_) / len(sys_)
-            if not (0.0 <= raw_cx <= 1.0 and 0.0 <= raw_cy <= 1.0):
-                return
+                w_norm = x_max_n - x_min_n
+                h_norm = y_max_n - y_min_n
+                cx_norm = (x_min_n + x_max_n) / 2.0
+                cy_norm = (y_min_n + y_max_n) / 2.0
 
-            x_min = max(0.0, min(sxs))
-            y_min = max(0.0, min(sys_))
-            x_max = min(1.0, max(sxs))
-            y_max = min(1.0, max(sys_))
-
-            if x_max <= x_min or y_max <= y_min:
-                return
-
-            w_norm = x_max - x_min
-            h_norm = y_max - y_min
-            cx_norm = (x_min + x_max) / 2.0
-            cy_norm = (y_min + y_max) / 2.0
-
-            if w_norm < 0.005 or h_norm < 0.005:
-                return
-
-            lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
-
-        stones_prim = stage.GetPrimAtPath("/World/Stones")
-        if stones_prim.IsValid():
-            for prim in stones_prim.GetChildren():
-                if not prim.IsValid():
+                # Skip tiny boxes (likely noise)
+                if w_norm < 0.005 or h_norm < 0.005:
                     continue
-                name_lower = prim.GetName().lower()
-                cls = CLASS_YELLOW if ('_y' in name_lower or 'yellow' in name_lower) else CLASS_RED
-                _project_stone(prim, cls)
 
-        # --- Hog Line ---
-        hog_prim = stage.GetPrimAtPath(HOG_LINE_PRIM_PATH)
-        if hog_prim.IsValid():
-            _project_prim_bbox(hog_prim, CLASS_HOG)
+                # Resolve semantic label → class ID
+                sem_id = str(data["info"]["semanticId"][i])
+                label_info = id_to_labels.get(sem_id, {})
+                sem_label = label_info.get("class", "")
 
-        # --- House Rings ---
-        house_prim = stage.GetPrimAtPath(HOUSE_RINGS_PRIM_PATH)
-        if house_prim.IsValid():
-            _project_prim_bbox(house_prim, CLASS_HOUSE)
+                class_id = self._SEMANTIC_TO_CLASS.get(sem_label)
+                if class_id is None:
+                    if DEBUG_LOGGING:
+                        carb.log_info(f"Skipping unknown semantic label: {sem_label}")
+                    continue
+
+                lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
 
         with open(label_path, 'w') as f:
             f.write('\n'.join(lines))
