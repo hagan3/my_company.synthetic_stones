@@ -235,7 +235,7 @@ class stoneUpdateExtension(omni.ext.IExt):
         # Attach bounding-box annotator for ground-truth labels.
         # Uses the renderer's own visibility / projection so labels
         # are guaranteed to match the captured image.
-        self._bbox_annotator = rep.annotator.get("bounding_box_2d_tight")
+        self._bbox_annotator = rep.AnnotatorRegistry.get_annotator("bounding_box_2d_tight")
         self._bbox_annotator.attach([render_product])
 
         # 4. Semantic labels on prims (documents class mapping, useful for annotators)
