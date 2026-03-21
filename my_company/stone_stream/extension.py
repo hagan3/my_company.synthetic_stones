@@ -535,19 +535,65 @@ class stoneUpdateExtension(omni.ext.IExt):
                 f.write('')
             return
 
-        bbox_data = data.get("data")
-        id_to_labels = data.get("info", {}).get("idToLabels", {})
+        # Log the annotator data structure on the first frame so we can
+        # diagnose format issues without enabling full DEBUG_LOGGING.
+        if not hasattr(self, '_bbox_format_logged'):
+            self._bbox_format_logged = True
+            try:
+                keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+                info_keys = list(data.get("info", {}).keys()) if isinstance(data, dict) else "N/A"
+                data_shape = None
+                raw = data.get("data") if isinstance(data, dict) else data
+                if hasattr(raw, 'shape'):
+                    data_shape = raw.shape
+                elif hasattr(raw, '__len__'):
+                    data_shape = len(raw)
+                carb.log_warn(
+                    f"bbox annotator structure: top_keys={keys}, "
+                    f"info_keys={info_keys}, data_shape={data_shape}"
+                )
+                # Log a sample entry if available
+                if isinstance(data, dict) and "info" in data:
+                    id_map = data["info"].get("idToLabels", {})
+                    sample_ids = dict(list(id_map.items())[:5]) if isinstance(id_map, dict) else str(id_map)[:300]
+                    carb.log_warn(f"bbox idToLabels sample: {sample_ids}")
+                if raw is not None and hasattr(raw, '__len__') and len(raw) > 0:
+                    carb.log_warn(f"bbox data[0] sample: {raw[0]}")
+            except Exception as e:
+                carb.log_warn(f"bbox annotator debug logging failed: {e}")
+
+        bbox_data = data.get("data") if isinstance(data, dict) else None
+        id_to_labels = {}
+        if isinstance(data, dict) and "info" in data:
+            id_to_labels = data["info"].get("idToLabels", {})
 
         lines = []
 
-        if bbox_data is not None and len(bbox_data) > 0:
+        if bbox_data is not None and hasattr(bbox_data, '__len__') and len(bbox_data) > 0:
             for i in range(len(bbox_data)):
                 bbox = bbox_data[i]
-                # bbox is [x_min, y_min, x_max, y_max] in pixel coords
-                x_min = float(bbox[0])
-                y_min = float(bbox[1])
-                x_max = float(bbox[2])
-                y_max = float(bbox[3])
+
+                # The annotator may return structured arrays or flat arrays;
+                # handle both [x_min, y_min, x_max, y_max] and named fields.
+                try:
+                    if hasattr(bbox, 'dtype') and bbox.dtype.names:
+                        # Structured numpy array with named fields
+                        x_min = float(bbox['x_min'])
+                        y_min = float(bbox['y_min'])
+                        x_max = float(bbox['x_max'])
+                        y_max = float(bbox['y_max'])
+                        sem_id = str(bbox['semanticId']) if 'semanticId' in bbox.dtype.names else str(i)
+                    else:
+                        x_min = float(bbox[0])
+                        y_min = float(bbox[1])
+                        x_max = float(bbox[2])
+                        y_max = float(bbox[3])
+                        # semanticId may be in a parallel array
+                        sem_ids = data.get("info", {}).get("semanticId", None)
+                        sem_id = str(sem_ids[i]) if sem_ids is not None else str(i)
+                except (KeyError, IndexError, TypeError) as e:
+                    carb.log_warn(f"bbox parse error at index {i}: {e}, bbox={bbox}")
+                    continue
 
                 # Skip degenerate / empty boxes
                 if x_max <= x_min or y_max <= y_min:
@@ -569,14 +615,16 @@ class stoneUpdateExtension(omni.ext.IExt):
                     continue
 
                 # Resolve semantic label → class ID
-                sem_id = str(data["info"]["semanticId"][i])
                 label_info = id_to_labels.get(sem_id, {})
-                sem_label = label_info.get("class", "")
+                sem_label = ""
+                if isinstance(label_info, dict):
+                    sem_label = label_info.get("class", "")
+                elif isinstance(label_info, str):
+                    sem_label = label_info
 
                 class_id = self._SEMANTIC_TO_CLASS.get(sem_label)
                 if class_id is None:
-                    if DEBUG_LOGGING:
-                        carb.log_info(f"Skipping unknown semantic label: {sem_label}")
+                    carb.log_info(f"Skipping unknown semantic label: '{sem_label}' (sem_id={sem_id})")
                     continue
 
                 lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
