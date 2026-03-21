@@ -496,7 +496,7 @@ class stoneUpdateExtension(omni.ext.IExt):
         return None
 
     def _project_to_screen(self, world_pt, cam_pos, cam_right, cam_up, cam_fwd,
-                           focal_length, h_aperture, v_aperture):
+                           focal_length, h_aperture):
         """Project a 3D world point to 2D screen pixel coordinates.
         Returns (px, py) or None if the point is behind the camera."""
         to_pt = world_pt - cam_pos
@@ -507,9 +507,15 @@ class stoneUpdateExtension(omni.ext.IExt):
         right = Gf.Dot(to_pt, cam_right)
         up = Gf.Dot(to_pt, cam_up)
 
+        # The renderer uses horizontal-fit mode: horizontal FOV is set by
+        # h_aperture, and vertical FOV is derived from the render aspect
+        # ratio — NOT from the camera's v_aperture.  For a square render
+        # (640x640) the effective vertical aperture equals h_aperture.
+        effective_v_aperture = h_aperture * (float(RENDER_HEIGHT) / float(RENDER_WIDTH))
+
         # Pinhole projection: NDC in [-1, 1]
         ndc_x = (right * 2.0 * focal_length) / (depth * h_aperture)
-        ndc_y = (up * 2.0 * focal_length) / (depth * v_aperture)
+        ndc_y = (up * 2.0 * focal_length) / (depth * effective_v_aperture)
 
         # Convert to pixel coordinates (Y flipped for image space)
         px = (ndc_x + 1.0) * 0.5 * RENDER_WIDTH
@@ -530,14 +536,13 @@ class stoneUpdateExtension(omni.ext.IExt):
         usd_cam = UsdGeom.Camera(self._camera_camera_prim)
         focal_length = usd_cam.GetFocalLengthAttr().Get()
         h_aperture = usd_cam.GetHorizontalApertureAttr().Get()
-        v_aperture = usd_cam.GetVerticalApertureAttr().Get()
 
-        return cam_pos, cam_right, cam_up, cam_fwd, focal_length, h_aperture, v_aperture
+        return cam_pos, cam_right, cam_up, cam_fwd, focal_length, h_aperture
 
     def _project_bbox_to_yolo(self, class_id, bbox_min_3d, bbox_max_3d, cam_params):
         """Project a 3D axis-aligned bounding box to YOLO format.
         Returns a YOLO line string or None if not visible."""
-        cam_pos, cam_right, cam_up, cam_fwd, fl, ha, va = cam_params
+        cam_pos, cam_right, cam_up, cam_fwd, fl, ha = cam_params
 
         # Project the 8 corners of the 3D AABB
         corners = [
@@ -554,7 +559,7 @@ class stoneUpdateExtension(omni.ext.IExt):
         screen_xs = []
         screen_ys = []
         for c in corners:
-            result = self._project_to_screen(c, cam_pos, cam_right, cam_up, cam_fwd, fl, ha, va)
+            result = self._project_to_screen(c, cam_pos, cam_right, cam_up, cam_fwd, fl, ha)
             if result is None:
                 continue
             screen_xs.append(result[0])
