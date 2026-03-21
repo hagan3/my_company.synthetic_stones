@@ -412,17 +412,16 @@ class stoneUpdateExtension(omni.ext.IExt):
                     if prim_path in self._stone_translate_ops:
                         self._stone_translate_ops[prim_path].Set(pos)
                     else:
-                        # Clear the entire xform stack so that the translate
-                        # op is the ONLY transform.  Without this, any
-                        # pre-existing ops (e.g. a TypeTransform matrix from
-                        # the original scene) would compose with our
-                        # translate, causing the rendered position to differ
-                        # from what the label projects.
                         xform = UsdGeom.Xformable(prim)
-                        xform.ClearXformOpOrder()
-                        op = xform.AddTranslateOp()
-                        op.Set(pos)
-                        self._stone_translate_ops[prim_path] = op
+                        for op in xform.GetOrderedXformOps():
+                            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                self._stone_translate_ops[prim_path] = op
+                                op.Set(pos)
+                                break
+                        else:
+                            op = xform.AddTranslateOp()
+                            op.Set(pos)
+                            self._stone_translate_ops[prim_path] = op
                 else:
                     # Could not place without collision, hide this stone
                     carb.log_warn(f"Could not place stone {prim.GetName()} after {MAX_PLACEMENT_ATTEMPTS} attempts, hiding.")
@@ -624,20 +623,18 @@ class stoneUpdateExtension(omni.ext.IExt):
         # --- Stones (fixed-radius projection for consistent bounding boxes) ---
         # All curling stones are the same physical size, so use a fixed radius
         # instead of BBoxCache which varies with mesh detail and rotation.
+        xform_cache = UsdGeom.XformCache(time_code)
+
         def _project_stone(prim, class_id):
             imageable = UsdGeom.Imageable(prim)
             if imageable.ComputeVisibility(time_code) == UsdGeom.Tokens.invisible:
                 return
 
-            # Read the stone's world position from its translate op
-            xformable = UsdGeom.Xformable(prim)
-            world_pos = None
-            for op in xformable.GetOrderedXformOps():
-                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                    world_pos = op.Get()
-                    break
-            if world_pos is None:
-                return
+            # Use XformCache to get the actual composed world transform,
+            # which accounts for ALL xform ops (translate, rotate, scale,
+            # matrix) — not just the translate op we set.
+            world_mtx = xform_cache.GetLocalToWorldTransform(prim)
+            world_pos = world_mtx.ExtractTranslation()
 
             # Project 8 points around the stone's rim plus center.
             # This produces a tight bbox even when the camera is tilted,
