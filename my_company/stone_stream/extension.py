@@ -119,13 +119,21 @@ class stoneUpdateExtension(omni.ext.IExt):
         # 1. Setup Graph (Camera, Writer)
         self._setup_graph()
 
-        # 2. Warm-up: prime the render pipeline so the first real frame
-        #    is fully synchronised.  The writer may produce an image here
-        #    (e.g. rgb_0000.png) which shifts its internal counter.
+        # 2. Warm-up: prime the render pipeline AND run one full
+        #    randomize-then-render cycle so the camera/scene are fully
+        #    initialised.  Images produced here are discarded (no labels).
         await rep.orchestrator.step_async()
         await omni.kit.app.get_app().next_update_async()
 
-        # Detect how many images the setup / warm-up produced so we can
+        # First randomised frame — ensures camera adjustments, lighting,
+        # and stone positions have all been applied at least once before
+        # we start recording.  The writer may save this as an image, but
+        # it won't have a matching label so we discard it below.
+        self._randomize_stones_per_frame()
+        await omni.kit.app.get_app().next_update_async()
+        await rep.orchestrator.step_async()
+
+        # Detect how many images the warm-up produced so we can
         # start our label numbering at the same offset.
         warmup_images = glob.glob(os.path.join(self._images_dir, "rgb_*.png"))
         label_start = len(warmup_images)
@@ -561,7 +569,6 @@ class stoneUpdateExtension(omni.ext.IExt):
             imageable = UsdGeom.Imageable(prim)
             if imageable.ComputeVisibility(time_code) == UsdGeom.Tokens.invisible:
                 return
-
             world_bbox = bbox_cache.ComputeWorldBound(prim)
             aligned = world_bbox.ComputeAlignedRange()
             if aligned.IsEmpty():
