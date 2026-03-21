@@ -19,7 +19,7 @@ import glob
 import os
 import random
 import omni.replicator.core as rep
-from pxr import UsdGeom, UsdLux, Gf, Usd
+from pxr import UsdGeom, UsdLux, Gf, Usd, Sdf
 import math
 
 # Coordinate transformation base constants
@@ -48,6 +48,9 @@ CLASS_YELLOW = 1
 CLASS_HOG = 2
 CLASS_HOUSE = 3
 
+# Approximate world-space radius of a curling stone (for bbox estimation)
+STONE_RADIUS = 14.0
+
 class stoneUpdateExtension(omni.ext.IExt):
     def on_startup(self, _ext_id):
         """This is called every time the extension is activated."""
@@ -72,7 +75,6 @@ class stoneUpdateExtension(omni.ext.IExt):
         self._is_running = False
         carb.log_info("Stopping Synthetic Stone Generation...")
         print("Stopping Synthetic Stone Generation...")
-        # rep.orchestrator.stop() # No longer needed with manual loop control
 
     def _on_start_clicked(self):
         carb.log_info("synthetic stones started")
@@ -222,8 +224,7 @@ class stoneUpdateExtension(omni.ext.IExt):
         xform.AddTranslateOp().Set(Gf.Vec3d(USD_ORIGIN_X - 200, USD_ORIGIN_Y + 100, USD_ORIGIN_Z + 500))
         carb.log_info("Created KeyLight at /World/KeyLight")
 
-        # 3. Writer + Annotator
-        # Initialize the BasicWriter to save RGB images
+        # 3. Writer (RGB only — labels are computed via manual projection)
         render_product = rep.create.render_product(camera, (RENDER_WIDTH, RENDER_HEIGHT))
         writer = rep.WriterRegistry.get("BasicWriter")
         writer.initialize(
@@ -231,15 +232,6 @@ class stoneUpdateExtension(omni.ext.IExt):
             rgb=True
         )
         writer.attach([render_product])
-
-        # Attach bounding-box annotator for ground-truth labels.
-        # Uses the renderer's own visibility / projection so labels
-        # are guaranteed to match the captured image.
-        self._bbox_annotator = rep.AnnotatorRegistry.get_annotator("bounding_box_2d_tight")
-        self._bbox_annotator.attach([render_product])
-
-        # 4. Semantic labels on prims (documents class mapping, useful for annotators)
-        self._setup_semantic_labels(stage)
 
         # Cache camera prim references to avoid stage.Traverse() every frame
         self._camera_xform_prim = None
@@ -250,6 +242,30 @@ class stoneUpdateExtension(omni.ext.IExt):
                     self._camera_camera_prim = prim
                 else:
                     self._camera_xform_prim = prim
+
+        # 4. Pre-compute world-space bounding boxes for static objects
+        self._static_objects = []  # list of (class_id, bbox_min, bbox_max)
+        bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+
+        hog_prim = stage.GetPrimAtPath(HOG_LINE_PRIM_PATH)
+        if hog_prim.IsValid():
+            bbox = bbox_cache.ComputeWorldBound(hog_prim)
+            rng = bbox.ComputeAlignedRange()
+            if not rng.IsEmpty():
+                self._static_objects.append((CLASS_HOG, rng.GetMin(), rng.GetMax()))
+                carb.log_info(f"Hog line bbox: {rng.GetMin()} -> {rng.GetMax()}")
+        else:
+            carb.log_warn(f"Hog line prim not found: {HOG_LINE_PRIM_PATH}")
+
+        house_prim = stage.GetPrimAtPath(HOUSE_RINGS_PRIM_PATH)
+        if house_prim.IsValid():
+            bbox = bbox_cache.ComputeWorldBound(house_prim)
+            rng = bbox.ComputeAlignedRange()
+            if not rng.IsEmpty():
+                self._static_objects.append((CLASS_HOUSE, rng.GetMin(), rng.GetMax()))
+                carb.log_info(f"House rings bbox: {rng.GetMin()} -> {rng.GetMax()}")
+        else:
+            carb.log_warn(f"House rings prim not found: {HOUSE_RINGS_PRIM_PATH}")
 
         # RTX real-time render settings for quality
         settings = carb.settings.get_settings()
@@ -279,44 +295,8 @@ class stoneUpdateExtension(omni.ext.IExt):
         # Cache stone translate ops to avoid searching xform ops every frame
         self._stone_translate_ops = {}
 
-    def _setup_semantic_labels(self, stage):
-        """Add semantic class labels to prims via Replicator's API so the
-        bounding_box_2d_tight annotator can detect them."""
-
-        # Stone prims — classify by name
-        stones_prim = stage.GetPrimAtPath("/World/Stones")
-        if stones_prim.IsValid():
-            for prim in stones_prim.GetChildren():
-                if not prim.IsValid():
-                    continue
-                name_lower = prim.GetName().lower()
-                if '_y' in name_lower or 'yellow' in name_lower:
-                    label = "yellow_stone"
-                else:
-                    label = "red_stone"
-                prim_path = str(prim.GetPath())
-                with rep.get.prims(path_pattern=prim_path):
-                    rep.modify.semantics([("class", label)])
-                carb.log_info(f"Labelled {prim_path} as {label}")
-            carb.log_info(f"Labelled {len(list(stones_prim.GetChildren()))} stone prims")
-
-        # Hog line mesh
-        hog_prim = stage.GetPrimAtPath(HOG_LINE_PRIM_PATH)
-        if hog_prim.IsValid():
-            with rep.get.prims(path_pattern=HOG_LINE_PRIM_PATH):
-                rep.modify.semantics([("class", "hog_line")])
-            carb.log_info(f"Labelled hog line: {HOG_LINE_PRIM_PATH}")
-        else:
-            carb.log_warn(f"Hog line prim not found: {HOG_LINE_PRIM_PATH}")
-
-        # House rings mesh
-        house_prim = stage.GetPrimAtPath(HOUSE_RINGS_PRIM_PATH)
-        if house_prim.IsValid():
-            with rep.get.prims(path_pattern=HOUSE_RINGS_PRIM_PATH):
-                rep.modify.semantics([("class", "house")])
-            carb.log_info(f"Labelled house rings: {HOUSE_RINGS_PRIM_PATH}")
-        else:
-            carb.log_warn(f"House rings prim not found: {HOUSE_RINGS_PRIM_PATH}")
+        # Per-frame visible objects list (populated by _randomize_stones_per_frame)
+        self._frame_visible_objects = []
 
     def _apply_subdivision_to_stones(self, stage):
         """Set Catmull-Clark subdivision scheme and refinement level 3 on all stone meshes."""
@@ -332,7 +312,6 @@ class stoneUpdateExtension(omni.ext.IExt):
                 mesh.GetSubdivisionSchemeAttr().Set("catmullClark")
                 refinement_attr = prim.GetAttribute("refinementLevel")
                 if not refinement_attr or not refinement_attr.IsValid():
-                    from pxr import Sdf
                     refinement_attr = prim.CreateAttribute("refinementLevel", Sdf.ValueTypeNames.Int)
                 refinement_attr.Set(1)
                 count += 1
@@ -371,8 +350,6 @@ class stoneUpdateExtension(omni.ext.IExt):
             carb.log_info(f"Frame {self._frame_counter}: Randomizing {len(all_stones)} stones...")
 
         # 1. Random Count [0, 16] (or max available)
-
-        # 1. Random Count [0, 16] (or max available)
         max_limit = min(len(all_stones), 16)
         count = random.randint(0, max_limit)
 
@@ -381,6 +358,9 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         # 3. Apply Visibility & Position with Collision Avoidance
         placed_positions = []  # Track placed stone positions for collision check
+
+        # Reset per-frame visible objects (stones only; static objects added in _write_yolo_labels)
+        self._frame_visible_objects = []
 
         for prim in all_stones:
             imageable = UsdGeom.Imageable(prim)
@@ -419,6 +399,14 @@ class stoneUpdateExtension(omni.ext.IExt):
                             op = xform.AddTranslateOp()
                             op.Set(pos)
                             self._stone_translate_ops[prim_path] = op
+
+                    # Determine class from prim name
+                    name_lower = prim.GetName().lower()
+                    if '_y' in name_lower or 'yellow' in name_lower:
+                        class_id = CLASS_YELLOW
+                    else:
+                        class_id = CLASS_RED
+                    self._frame_visible_objects.append((class_id, rand_x, rand_y))
                 else:
                     # Could not place without collision, hide this stone
                     carb.log_warn(f"Could not place stone {prim.GetName()} after {MAX_PLACEMENT_ATTEMPTS} attempts, hiding.")
@@ -507,121 +495,118 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         return None
 
-    # Mapping from semantic label strings to YOLO class IDs.
-    _SEMANTIC_TO_CLASS = {
-        "red_stone": CLASS_RED,
-        "yellow_stone": CLASS_YELLOW,
-        "hog_line": CLASS_HOG,
-        "house": CLASS_HOUSE,
-    }
+    def _project_to_screen(self, world_pt, cam_pos, cam_right, cam_up, cam_fwd,
+                           focal_length, h_aperture, v_aperture):
+        """Project a 3D world point to 2D screen pixel coordinates.
+        Returns (px, py) or None if the point is behind the camera."""
+        to_pt = world_pt - cam_pos
+        depth = Gf.Dot(to_pt, cam_fwd)
+        if depth <= 0:
+            return None
+
+        right = Gf.Dot(to_pt, cam_right)
+        up = Gf.Dot(to_pt, cam_up)
+
+        # Pinhole projection: NDC in [-1, 1]
+        ndc_x = (right * 2.0 * focal_length) / (depth * h_aperture)
+        ndc_y = (up * 2.0 * focal_length) / (depth * v_aperture)
+
+        # Convert to pixel coordinates (Y flipped for image space)
+        px = (ndc_x + 1.0) * 0.5 * RENDER_WIDTH
+        py = (1.0 - ndc_y) * 0.5 * RENDER_HEIGHT
+        return px, py
+
+    def _get_camera_params(self):
+        """Extract camera axes and lens parameters for projection."""
+        xform_cache = UsdGeom.XformCache()
+        cam_world = xform_cache.GetLocalToWorldTransform(self._camera_camera_prim)
+        cam_pos = Gf.Vec3d(cam_world[3][0], cam_world[3][1], cam_world[3][2])
+
+        # Camera axes from the world transform (USD camera looks along -Z)
+        cam_right = Gf.Vec3d(cam_world[0][0], cam_world[0][1], cam_world[0][2]).GetNormalized()
+        cam_up = Gf.Vec3d(cam_world[1][0], cam_world[1][1], cam_world[1][2]).GetNormalized()
+        cam_fwd = -Gf.Vec3d(cam_world[2][0], cam_world[2][1], cam_world[2][2]).GetNormalized()
+
+        usd_cam = UsdGeom.Camera(self._camera_camera_prim)
+        focal_length = usd_cam.GetFocalLengthAttr().Get()
+        h_aperture = usd_cam.GetHorizontalApertureAttr().Get()
+        v_aperture = usd_cam.GetVerticalApertureAttr().Get()
+
+        return cam_pos, cam_right, cam_up, cam_fwd, focal_length, h_aperture, v_aperture
+
+    def _project_bbox_to_yolo(self, class_id, bbox_min_3d, bbox_max_3d, cam_params):
+        """Project a 3D axis-aligned bounding box to YOLO format.
+        Returns a YOLO line string or None if not visible."""
+        cam_pos, cam_right, cam_up, cam_fwd, fl, ha, va = cam_params
+
+        # Project the 8 corners of the 3D AABB
+        corners = [
+            Gf.Vec3d(bbox_min_3d[0], bbox_min_3d[1], bbox_min_3d[2]),
+            Gf.Vec3d(bbox_max_3d[0], bbox_min_3d[1], bbox_min_3d[2]),
+            Gf.Vec3d(bbox_min_3d[0], bbox_max_3d[1], bbox_min_3d[2]),
+            Gf.Vec3d(bbox_max_3d[0], bbox_max_3d[1], bbox_min_3d[2]),
+            Gf.Vec3d(bbox_min_3d[0], bbox_min_3d[1], bbox_max_3d[2]),
+            Gf.Vec3d(bbox_max_3d[0], bbox_min_3d[1], bbox_max_3d[2]),
+            Gf.Vec3d(bbox_min_3d[0], bbox_max_3d[1], bbox_max_3d[2]),
+            Gf.Vec3d(bbox_max_3d[0], bbox_max_3d[1], bbox_max_3d[2]),
+        ]
+
+        screen_xs = []
+        screen_ys = []
+        for c in corners:
+            result = self._project_to_screen(c, cam_pos, cam_right, cam_up, cam_fwd, fl, ha, va)
+            if result is None:
+                continue
+            screen_xs.append(result[0])
+            screen_ys.append(result[1])
+
+        if len(screen_xs) < 2:
+            return None
+
+        # Screen-space AABB from projected corners
+        x_min = max(0.0, min(screen_xs))
+        y_min = max(0.0, min(screen_ys))
+        x_max = min(float(RENDER_WIDTH), max(screen_xs))
+        y_max = min(float(RENDER_HEIGHT), max(screen_ys))
+
+        if x_max <= x_min or y_max <= y_min:
+            return None
+
+        # YOLO normalized format
+        w_n = (x_max - x_min) / RENDER_WIDTH
+        h_n = (y_max - y_min) / RENDER_HEIGHT
+
+        # Skip tiny boxes (likely not meaningfully visible)
+        if w_n < 0.005 or h_n < 0.005:
+            return None
+
+        cx_n = ((x_min + x_max) / 2.0) / RENDER_WIDTH
+        cy_n = ((y_min + y_max) / 2.0) / RENDER_HEIGHT
+
+        return f"{class_id} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}"
 
     def _write_yolo_labels(self, frame_index):
-        """Write YOLO format labels from Replicator's bounding_box_2d_tight
-        annotator.  Because the annotator reads directly from the renderer,
-        every bbox is guaranteed to correspond to a visible object in the
-        captured image — no manual projection or visibility guessing needed.
+        """Write YOLO format labels by projecting known 3D object positions
+        through the camera.
         Format: class_id center_x center_y width height (all normalized 0-1)"""
         label_path = os.path.join(self._labels_dir, f"rgb_{frame_index:04d}.txt")
 
-        data = self._bbox_annotator.get_data()
-        if data is None:
-            with open(label_path, 'w') as f:
-                f.write('')
-            return
-
-        # Log the annotator data structure on the first frame so we can
-        # diagnose format issues without enabling full DEBUG_LOGGING.
-        if not hasattr(self, '_bbox_format_logged'):
-            self._bbox_format_logged = True
-            try:
-                keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-                info_keys = list(data.get("info", {}).keys()) if isinstance(data, dict) else "N/A"
-                data_shape = None
-                raw = data.get("data") if isinstance(data, dict) else data
-                if hasattr(raw, 'shape'):
-                    data_shape = raw.shape
-                elif hasattr(raw, '__len__'):
-                    data_shape = len(raw)
-                carb.log_warn(
-                    f"bbox annotator structure: top_keys={keys}, "
-                    f"info_keys={info_keys}, data_shape={data_shape}"
-                )
-                # Log a sample entry if available
-                if isinstance(data, dict) and "info" in data:
-                    id_map = data["info"].get("idToLabels", {})
-                    sample_ids = dict(list(id_map.items())[:5]) if isinstance(id_map, dict) else str(id_map)[:300]
-                    carb.log_warn(f"bbox idToLabels sample: {sample_ids}")
-                if raw is not None and hasattr(raw, '__len__') and len(raw) > 0:
-                    carb.log_warn(f"bbox data[0] sample: {raw[0]}")
-            except Exception as e:
-                carb.log_warn(f"bbox annotator debug logging failed: {e}")
-
-        bbox_data = data.get("data") if isinstance(data, dict) else None
-        id_to_labels = {}
-        if isinstance(data, dict) and "info" in data:
-            id_to_labels = data["info"].get("idToLabels", {})
-
+        cam_params = self._get_camera_params()
         lines = []
 
-        if bbox_data is not None and hasattr(bbox_data, '__len__') and len(bbox_data) > 0:
-            for i in range(len(bbox_data)):
-                bbox = bbox_data[i]
+        # 1. Stones (positions tracked during randomization)
+        for class_id, wx, wy in self._frame_visible_objects:
+            bbox_min = Gf.Vec3d(wx - STONE_RADIUS, wy - STONE_RADIUS, USD_ORIGIN_Z)
+            bbox_max = Gf.Vec3d(wx + STONE_RADIUS, wy + STONE_RADIUS, USD_ORIGIN_Z + STONE_RADIUS)
+            line = self._project_bbox_to_yolo(class_id, bbox_min, bbox_max, cam_params)
+            if line:
+                lines.append(line)
 
-                # The annotator may return structured arrays or flat arrays;
-                # handle both [x_min, y_min, x_max, y_max] and named fields.
-                try:
-                    if hasattr(bbox, 'dtype') and bbox.dtype.names:
-                        # Structured numpy array with named fields
-                        x_min = float(bbox['x_min'])
-                        y_min = float(bbox['y_min'])
-                        x_max = float(bbox['x_max'])
-                        y_max = float(bbox['y_max'])
-                        sem_id = str(bbox['semanticId']) if 'semanticId' in bbox.dtype.names else str(i)
-                    else:
-                        x_min = float(bbox[0])
-                        y_min = float(bbox[1])
-                        x_max = float(bbox[2])
-                        y_max = float(bbox[3])
-                        # semanticId may be in a parallel array
-                        sem_ids = data.get("info", {}).get("semanticId", None)
-                        sem_id = str(sem_ids[i]) if sem_ids is not None else str(i)
-                except (KeyError, IndexError, TypeError) as e:
-                    carb.log_warn(f"bbox parse error at index {i}: {e}, bbox={bbox}")
-                    continue
-
-                # Skip degenerate / empty boxes
-                if x_max <= x_min or y_max <= y_min:
-                    continue
-
-                # Normalize to [0, 1]
-                x_min_n = x_min / RENDER_WIDTH
-                y_min_n = y_min / RENDER_HEIGHT
-                x_max_n = x_max / RENDER_WIDTH
-                y_max_n = y_max / RENDER_HEIGHT
-
-                w_norm = x_max_n - x_min_n
-                h_norm = y_max_n - y_min_n
-                cx_norm = (x_min_n + x_max_n) / 2.0
-                cy_norm = (y_min_n + y_max_n) / 2.0
-
-                # Skip tiny boxes (likely noise)
-                if w_norm < 0.005 or h_norm < 0.005:
-                    continue
-
-                # Resolve semantic label → class ID
-                label_info = id_to_labels.get(sem_id, {})
-                sem_label = ""
-                if isinstance(label_info, dict):
-                    sem_label = label_info.get("class", "")
-                elif isinstance(label_info, str):
-                    sem_label = label_info
-
-                class_id = self._SEMANTIC_TO_CLASS.get(sem_label)
-                if class_id is None:
-                    carb.log_info(f"Skipping unknown semantic label: '{sem_label}' (sem_id={sem_id})")
-                    continue
-
-                lines.append(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}")
+        # 2. Static objects (hog line, house rings) — always in the scene
+        for class_id, bbox_min, bbox_max in self._static_objects:
+            line = self._project_bbox_to_yolo(class_id, bbox_min, bbox_max, cam_params)
+            if line:
+                lines.append(line)
 
         with open(label_path, 'w') as f:
             f.write('\n'.join(lines))
