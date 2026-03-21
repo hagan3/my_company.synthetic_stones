@@ -280,18 +280,8 @@ class stoneUpdateExtension(omni.ext.IExt):
         self._stone_translate_ops = {}
 
     def _setup_semantic_labels(self, stage):
-        """Add semantic class labels to prims so the bbox annotator can identify them."""
-        from pxr import Sdf
-
-        def _add_label(prim, label):
-            prim.CreateAttribute(
-                "semantics:Semantics:params:semanticType",
-                Sdf.ValueTypeNames.String
-            ).Set("class")
-            prim.CreateAttribute(
-                "semantics:Semantics:params:semanticData",
-                Sdf.ValueTypeNames.String
-            ).Set(label)
+        """Add semantic class labels to prims via Replicator's API so the
+        bounding_box_2d_tight annotator can detect them."""
 
         # Stone prims — classify by name
         stones_prim = stage.GetPrimAtPath("/World/Stones")
@@ -300,18 +290,21 @@ class stoneUpdateExtension(omni.ext.IExt):
                 if not prim.IsValid():
                     continue
                 name_lower = prim.GetName().lower()
-                if '_r' in name_lower or 'red' in name_lower:
-                    _add_label(prim, "red_stone")
-                elif '_y' in name_lower or 'yellow' in name_lower:
-                    _add_label(prim, "yellow_stone")
+                if '_y' in name_lower or 'yellow' in name_lower:
+                    label = "yellow_stone"
                 else:
-                    _add_label(prim, "red_stone")
+                    label = "red_stone"
+                prim_path = str(prim.GetPath())
+                with rep.get.prims(path_pattern=prim_path):
+                    rep.modify.semantics([("class", label)])
+                carb.log_info(f"Labelled {prim_path} as {label}")
             carb.log_info(f"Labelled {len(list(stones_prim.GetChildren()))} stone prims")
 
         # Hog line mesh
         hog_prim = stage.GetPrimAtPath(HOG_LINE_PRIM_PATH)
         if hog_prim.IsValid():
-            _add_label(hog_prim, "hog_line")
+            with rep.get.prims(path_pattern=HOG_LINE_PRIM_PATH):
+                rep.modify.semantics([("class", "hog_line")])
             carb.log_info(f"Labelled hog line: {HOG_LINE_PRIM_PATH}")
         else:
             carb.log_warn(f"Hog line prim not found: {HOG_LINE_PRIM_PATH}")
@@ -319,7 +312,8 @@ class stoneUpdateExtension(omni.ext.IExt):
         # House rings mesh
         house_prim = stage.GetPrimAtPath(HOUSE_RINGS_PRIM_PATH)
         if house_prim.IsValid():
-            _add_label(house_prim, "house")
+            with rep.get.prims(path_pattern=HOUSE_RINGS_PRIM_PATH):
+                rep.modify.semantics([("class", "house")])
             carb.log_info(f"Labelled house rings: {HOUSE_RINGS_PRIM_PATH}")
         else:
             carb.log_warn(f"House rings prim not found: {HOUSE_RINGS_PRIM_PATH}")
