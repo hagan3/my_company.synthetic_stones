@@ -434,9 +434,16 @@ class stoneUpdateExtension(omni.ext.IExt):
             f"{excluded} excluded out of {len(all_children)} total"
         )
         if excluded > 0:
-            excluded_names = [p.GetName() for p in all_children if p not in controllable]
+            excluded_prims = [p for p in all_children if p not in controllable]
+            excluded_names = [p.GetName() for p in excluded_prims]
             carb.log_warn(f"Excluded stones: {excluded_names}")
             print(f"Excluded stones from randomization: {excluded_names}")
+            # Remove uncontrollable stones from the stage so they don't
+            # appear as unlabeled objects in the rendered training images.
+            for prim in excluded_prims:
+                prim_path = str(prim.GetPath())
+                stage.RemovePrim(prim_path)
+                carb.log_info(f"Removed uncontrollable stone from stage: {prim_path}")
 
         return controllable
 
