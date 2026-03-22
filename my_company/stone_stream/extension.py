@@ -317,6 +317,10 @@ class stoneUpdateExtension(omni.ext.IExt):
         # Per-frame visible objects list (populated by _randomize_stones_per_frame)
         self._frame_visible_objects = []
 
+        # Validate which stones can actually be controlled (visibility + position).
+        # Locked / instanced prims are excluded from randomization.
+        self._controllable_stones = self._validate_stones(stage)
+
     def _apply_subdivision_to_stones(self, stage):
         """Set Catmull-Clark subdivision scheme and refinement level 3 on all stone meshes."""
         stones_prim = stage.GetPrimAtPath("/World/Stones")
@@ -338,6 +342,104 @@ class stoneUpdateExtension(omni.ext.IExt):
         carb.log_info(f"Applied Catmull-Clark subdivision (refinement=1) to {count} stone meshes")
         print(f"Applied Catmull-Clark subdivision (refinement=1) to {count} stone meshes")
 
+    def _validate_stones(self, stage):
+        """Check which stones can be controlled (visibility + transform).
+        Excludes instance proxies and prims whose visibility or translation
+        cannot actually be changed.  Returns list of controllable prims."""
+        stones_prim = stage.GetPrimAtPath("/World/Stones")
+        if not stones_prim.IsValid():
+            carb.log_warn("No stones found at /World/Stones for validation")
+            return []
+
+        controllable = []
+        all_children = [p for p in stones_prim.GetChildren() if p.IsValid()]
+
+        for prim in all_children:
+            name = prim.GetName()
+
+            # Instance proxies are read-only projections of a prototype —
+            # we cannot change their visibility or transform.
+            if prim.IsInstanceProxy() or prim.IsInstance():
+                carb.log_warn(f"Stone '{name}' is an instance/proxy — excluding")
+                continue
+
+            # --- Visibility test ---
+            imageable = UsdGeom.Imageable(prim)
+            vis_attr = imageable.GetVisibilityAttr()
+            if not vis_attr or not vis_attr.IsValid():
+                carb.log_warn(f"Stone '{name}' has no visibility attr — excluding")
+                continue
+
+            original_vis = vis_attr.Get()
+            imageable.MakeInvisible()
+            readback_vis = vis_attr.Get()
+            # Restore original
+            if original_vis == UsdGeom.Tokens.invisible:
+                imageable.MakeInvisible()
+            else:
+                imageable.MakeVisible()
+
+            if readback_vis != UsdGeom.Tokens.invisible:
+                carb.log_warn(
+                    f"Stone '{name}' visibility cannot be changed "
+                    f"(wrote 'invisible', read back '{readback_vis}') — excluding"
+                )
+                continue
+
+            # --- Translation test ---
+            xform = UsdGeom.Xformable(prim)
+            test_pos = Gf.Vec3d(99999.0, 99999.0, 99999.0)
+            translate_op = None
+            for op in xform.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                    translate_op = op
+                    break
+
+            if translate_op:
+                old_val = translate_op.Get()
+                translate_op.Set(test_pos)
+                readback_pos = translate_op.Get()
+                # Restore
+                if old_val is not None:
+                    translate_op.Set(old_val)
+                else:
+                    translate_op.Set(Gf.Vec3d(0, 0, 0))
+
+                if readback_pos != test_pos:
+                    carb.log_warn(
+                        f"Stone '{name}' translate cannot be changed — excluding"
+                    )
+                    continue
+            else:
+                # No existing translate op — try to create one
+                try:
+                    new_op = xform.AddTranslateOp()
+                    new_op.Set(test_pos)
+                    readback_pos = new_op.Get()
+                    new_op.Set(Gf.Vec3d(0, 0, 0))
+                    if readback_pos != test_pos:
+                        carb.log_warn(
+                            f"Stone '{name}' new translate op not writable — excluding"
+                        )
+                        continue
+                except Exception as e:
+                    carb.log_warn(f"Stone '{name}' cannot add translate op ({e}) — excluding")
+                    continue
+
+            controllable.append(prim)
+
+        excluded = len(all_children) - len(controllable)
+        carb.log_info(
+            f"Stone validation: {len(controllable)} controllable, "
+            f"{excluded} excluded out of {len(all_children)} total"
+        )
+        if excluded > 0:
+            excluded_names = [p.GetName() for p in all_children if p not in controllable]
+            carb.log_warn(f"Excluded stones: {excluded_names}")
+            print(f"Excluded stones from randomization: {excluded_names}")
+
+        return controllable
+
     def _randomize_stones_per_frame(self):
         """
         Custom function mapped to Replicator randomizer.
@@ -354,15 +456,9 @@ class stoneUpdateExtension(omni.ext.IExt):
         if not stage:
             return
 
-        stones_prim = stage.GetPrimAtPath("/World/Stones")
-        if not stones_prim.IsValid():
-            carb.log_warn("No stones found at /World/Stones")
-            return
-
-        # Get all valid stone prims
-        all_stones = [prim for prim in stones_prim.GetChildren() if prim.IsValid()]
+        # Use only stones that passed the controllability check at setup
+        all_stones = self._controllable_stones
         if not all_stones:
-            carb.log_error("No stones found!")
             return
 
         if DEBUG_LOGGING:
