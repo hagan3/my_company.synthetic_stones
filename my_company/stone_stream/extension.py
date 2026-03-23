@@ -31,6 +31,9 @@ USD_ORIGIN_Z = 36.5
 MIN_STONE_DISTANCE = 30.0
 MIN_STONE_DISTANCE_SQ = MIN_STONE_DISTANCE * MIN_STONE_DISTANCE
 MAX_PLACEMENT_ATTEMPTS = 50
+# Off-screen parking position for hidden stones (far from any camera view)
+# Stored as tuple; converted to Gf.Vec3d at runtime to avoid module-load issues
+HIDDEN_STONE_POS = (99999.0, 99999.0, -99999.0)
 # Render product resolution (must match render_product creation in _setup_graph)
 RENDER_WIDTH = 640
 RENDER_HEIGHT = 640
@@ -52,15 +55,16 @@ CLASS_HOUSE = 3
 STONE_RADIUS = 14.0
 
 class stoneUpdateExtension(omni.ext.IExt):
-    def on_startup(self, _ext_id):
+    def on_startup(self, ext_id):
         """This is called every time the extension is activated."""
         carb.log_info("[my_company.stone_stream] Extension startup")
 
+        self._ext_id = ext_id
         self._window = None
         self._build_ui()
 
     def _build_ui(self):
-        self._window = ui.Window("Synthetic Stones", width=300, height=150)
+        self._window = ui.Window("Synthetic Stones", width=300, height=200)
         with self._window.frame:
             with ui.VStack(spacing=5):
                 ui.Label("Synthetic Stone Generator", alignment=ui.Alignment.CENTER)
@@ -70,11 +74,27 @@ class stoneUpdateExtension(omni.ext.IExt):
                     ui.IntDrag(model=self._image_count_model, min=1, max=10000, step=1)
                 ui.Button("Start Generation", clicked_fn=self._on_start_clicked)
                 ui.Button("Stop Generation", clicked_fn=self._on_stop_clicked)
+                ui.Spacer(height=5)
+                ui.Button("Reload Extension", clicked_fn=self._on_reload_clicked)
 
     def _on_stop_clicked(self):
         self._is_running = False
         carb.log_info("Stopping Synthetic Stone Generation...")
         print("Stopping Synthetic Stone Generation...")
+
+    def _on_reload_clicked(self):
+        """Hot-reload this extension by disabling and re-enabling it."""
+        print("Reloading extension...")
+        manager = omni.kit.app.get_app().get_extension_manager()
+        ext_id = self._ext_id
+
+        async def _reload():
+            manager.set_extension_enabled_immediate(ext_id, False)
+            await omni.kit.app.get_app().next_update_async()
+            manager.set_extension_enabled_immediate(ext_id, True)
+            print("Extension reloaded.")
+
+        asyncio.ensure_future(_reload())
 
     def _on_start_clicked(self):
         carb.log_info("synthetic stones started")
@@ -136,16 +156,17 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         # 3. Generation loop
         #
-        # The Replicator render pipeline has a 1-frame delay: step_async()
-        # at time T writes the image that was *rendered* during step T-1.
-        # To keep labels in sync with images we capture each frame's label
-        # data immediately, then write it one step later — when the
-        # matching image is actually flushed to disk.
+        # The Replicator pipeline has a 1-frame delay: step_async()
+        # writes the image rendered during the PREVIOUS step's scene.
+        # We use pending_label to hold the previous scene's labels,
+        # and detect the actual image filename (instead of guessing
+        # frame_id) to guarantee name alignment.
         num_images = self._image_count_model.get_value_as_int()
         carb.log_info(f"Generating {num_images} images...")
         print(f"Generating {num_images} images...")
 
-        pending_label = None  # (visible_objects, cam_params) awaiting image flush
+        known_images = set(os.path.basename(f) for f in glob.glob(os.path.join(self._images_dir, "rgb_*.png")))
+        pending_label = None  # labels from previous iteration, awaiting image flush
 
         for i in range(num_images):
             if not self._is_running:
@@ -154,7 +175,7 @@ class stoneUpdateExtension(omni.ext.IExt):
             self._randomize_stones_per_frame()
             await omni.kit.app.get_app().next_update_async()
 
-            # Capture label data for this scene before stepping
+            # Capture label data for this scene
             current_label = (
                 list(self._frame_visible_objects),
                 self._get_camera_params(),
@@ -162,25 +183,33 @@ class stoneUpdateExtension(omni.ext.IExt):
 
             await rep.orchestrator.step_async()
 
-            # step just saved the PREVIOUS scene's render to disk.
-            # Write the matching label.
-            if pending_label is not None:
-                frame_id = label_start + i
-                prev_objects, prev_cam = pending_label
-                self._write_yolo_labels(frame_id, prev_objects, prev_cam)
-                if DEBUG_LOGGING:
-                    print(f"Image Generated: rgb_{frame_id:04d}.png")
-                carb.log_info(f"Generated rgb_{frame_id:04d}.png")
+            # Detect new image(s) written by this step
+            current_images = set(os.path.basename(f) for f in glob.glob(os.path.join(self._images_dir, "rgb_*.png")))
+            new_images = sorted(current_images - known_images)
+            known_images = current_images
+
+            # step_async() just flushed the PREVIOUS scene's render.
+            # Write the previous scene's labels to match that image.
+            if new_images and pending_label is not None:
+                base = os.path.splitext(new_images[0])[0]
+                objects, cam = pending_label
+                label_path = os.path.join(self._labels_dir, f"{base}.txt")
+                self._write_yolo_labels_to_path(label_path, objects, cam)
+                carb.log_info(f"Generated {new_images[0]} with label {base}.txt")
 
             pending_label = current_label
 
-        # One final step to flush the last frame's render to disk
+        # Final step to flush the last scene's render
         if pending_label is not None and self._is_running:
             await rep.orchestrator.step_async()
-            frame_id = label_start + num_images
-            prev_objects, prev_cam = pending_label
-            self._write_yolo_labels(frame_id, prev_objects, prev_cam)
-            carb.log_info(f"Generated rgb_{frame_id:04d}.png")
+            current_images = set(os.path.basename(f) for f in glob.glob(os.path.join(self._images_dir, "rgb_*.png")))
+            new_images = sorted(current_images - known_images)
+            if new_images:
+                base = os.path.splitext(new_images[0])[0]
+                objects, cam = pending_label
+                label_path = os.path.join(self._labels_dir, f"{base}.txt")
+                self._write_yolo_labels_to_path(label_path, objects, cam)
+                carb.log_info(f"Generated {new_images[0]} with label {base}.txt")
 
         # Remove all images that have no matching label file
         labeled_bases = set()
@@ -321,6 +350,9 @@ class stoneUpdateExtension(omni.ext.IExt):
         # Locked / instanced prims are excluded from randomization.
         self._controllable_stones = self._validate_stones(stage)
 
+        # Deep audit of each controllable stone
+        self._audit_stones(stage)
+
     def _apply_subdivision_to_stones(self, stage):
         """Set Catmull-Clark subdivision scheme and refinement level 3 on all stone meshes."""
         stones_prim = stage.GetPrimAtPath("/World/Stones")
@@ -447,6 +479,109 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         return controllable
 
+    def _audit_stones(self, stage):
+        """Deep audit of all controllable stones: dump prim hierarchy, xform ops,
+        references, child meshes, and verify world-position readback.
+        Runs once at setup to surface structural issues."""
+        print(f"\n{'='*60}")
+        print(f"STONE AUDIT — {len(self._controllable_stones)} controllable stones")
+        print(f"{'='*60}")
+
+        xform_cache = UsdGeom.XformCache()
+
+        for idx, prim in enumerate(self._controllable_stones):
+            name = prim.GetName()
+            path = str(prim.GetPath())
+            prim_type = prim.GetTypeName()
+
+            print(f"\n--- [{idx}] {name} ({prim_type}) @ {path} ---")
+
+            # Composition: references, payloads, inherits
+            if prim.HasAuthoredReferences():
+                refs = prim.GetReferences()
+                print(f"  Has authored references (could contain internal transforms)")
+            if prim.HasPayload():
+                print(f"  Has payload (deferred load)")
+
+            # Xform ops on this prim
+            xformable = UsdGeom.Xformable(prim)
+            ops = xformable.GetOrderedXformOps()
+            reset_stack = xformable.GetResetXformStack()
+            print(f"  XformOps ({len(ops)}), resetXformStack={reset_stack}:")
+            for op in ops:
+                op_name = op.GetName()
+                op_type = op.GetOpType()
+                op_val = op.Get()
+                print(f"    {op_name} (type={op_type}): {op_val}")
+
+            # Computed world transform
+            world_xform = xform_cache.GetLocalToWorldTransform(prim)
+            world_pos = Gf.Vec3d(world_xform[3][0], world_xform[3][1], world_xform[3][2])
+            print(f"  World position: ({world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f})")
+
+            # Visibility
+            imageable = UsdGeom.Imageable(prim)
+            vis = imageable.GetVisibilityAttr().Get()
+            computed_vis = imageable.ComputeVisibility()
+            print(f"  Visibility: attr={vis}, computed={computed_vis}")
+
+            # Children (meshes, sub-xforms, etc.)
+            children = prim.GetChildren()
+            if children:
+                print(f"  Children ({len(children)}):")
+                for child in children:
+                    child_type = child.GetTypeName()
+                    child_path = str(child.GetPath())
+                    # Check if child has its own xform ops
+                    child_xformable = UsdGeom.Xformable(child)
+                    child_ops = child_xformable.GetOrderedXformOps() if child_xformable else []
+                    child_vis_attr = UsdGeom.Imageable(child).GetVisibilityAttr()
+                    child_vis = child_vis_attr.Get() if child_vis_attr else "N/A"
+
+                    child_world = xform_cache.GetLocalToWorldTransform(child)
+                    child_world_pos = Gf.Vec3d(child_world[3][0], child_world[3][1], child_world[3][2])
+
+                    print(f"    {child.GetName()} ({child_type}): "
+                          f"vis={child_vis}, xformOps={len(child_ops)}, "
+                          f"worldPos=({child_world_pos[0]:.2f}, {child_world_pos[1]:.2f}, {child_world_pos[2]:.2f})")
+
+                    # If child has its own xform ops, dump them
+                    if child_ops:
+                        for cop in child_ops:
+                            print(f"      {cop.GetName()} (type={cop.GetOpType()}): {cop.Get()}")
+            else:
+                print(f"  No children")
+
+            # Verify round-trip: set position, read back world transform
+            test_pos = Gf.Vec3d(1000.0, 2000.0, USD_ORIGIN_Z)
+            prim_path_sdf = prim.GetPath()
+            translate_op = None
+            for op in xformable.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                    translate_op = op
+                    break
+
+            if translate_op:
+                old_val = translate_op.Get()
+                translate_op.Set(test_pos)
+                # Refresh cache
+                xform_cache_test = UsdGeom.XformCache()
+                test_world = xform_cache_test.GetLocalToWorldTransform(prim)
+                test_world_pos = Gf.Vec3d(test_world[3][0], test_world[3][1], test_world[3][2])
+                delta = (test_world_pos - test_pos).GetLength()
+                print(f"  Position round-trip: set={test_pos}, readback={test_world_pos}, delta={delta:.4f}")
+                if delta > 1.0:
+                    print(f"  *** WARNING: World position does not match translate op! "
+                          f"Other xform ops or parent transforms may be interfering. ***")
+                # Restore
+                translate_op.Set(old_val if old_val else Gf.Vec3d(0, 0, 0))
+            else:
+                print(f"  *** WARNING: No translate op found on this prim! ***")
+
+        print(f"\n{'='*60}")
+        print(f"STONE AUDIT COMPLETE")
+        print(f"{'='*60}\n")
+
     def _randomize_stones_per_frame(self):
         """
         Custom function mapped to Replicator randomizer.
@@ -499,8 +634,13 @@ class stoneUpdateExtension(omni.ext.IExt):
                     rand_x, rand_y = position
                     placed_positions.append((rand_x, rand_y))
 
-                    # Make Visible
+                    # Make Visible — must also clear any 'invisible' on
+                    # descendant prims (e.g. curlingstone2 child xform)
                     imageable.MakeVisible()
+                    for desc in Usd.PrimRange(prim):
+                        desc_img = UsdGeom.Imageable(desc)
+                        if desc_img and desc_img.GetVisibilityAttr().Get() == UsdGeom.Tokens.invisible:
+                            desc_img.MakeVisible()
 
                     if DEBUG_LOGGING:
                         carb.log_info(f"Stone {prim.GetName()} -> Pos: ({rand_x:.2f}, {rand_y:.2f})")
@@ -530,13 +670,68 @@ class stoneUpdateExtension(omni.ext.IExt):
                         class_id = CLASS_RED
                     self._frame_visible_objects.append((class_id, rand_x, rand_y))
                 else:
-                    # Could not place without collision, hide this stone
+                    # Could not place without collision, hide and park off-screen
                     carb.log_warn(f"Could not place stone {prim.GetName()} after {MAX_PLACEMENT_ATTEMPTS} attempts, hiding.")
                     imageable.MakeInvisible()
+                    prim_path = prim.GetPath()
+                    if prim_path in self._stone_translate_ops:
+                        self._stone_translate_ops[prim_path].Set(Gf.Vec3d(*HIDDEN_STONE_POS))
+                    else:
+                        xform_hide = UsdGeom.Xformable(prim)
+                        for op in xform_hide.GetOrderedXformOps():
+                            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                self._stone_translate_ops[prim_path] = op
+                                op.Set(Gf.Vec3d(*HIDDEN_STONE_POS))
+                                break
 
             else:
-                # Make Invisible
+                # Make Invisible AND move off-screen to prevent phantom renders
+                # if Hydra visibility update lags behind the render pass
                 imageable.MakeInvisible()
+                prim_path = prim.GetPath()
+                if prim_path in self._stone_translate_ops:
+                    self._stone_translate_ops[prim_path].Set(Gf.Vec3d(*HIDDEN_STONE_POS))
+                else:
+                    xform = UsdGeom.Xformable(prim)
+                    for op in xform.GetOrderedXformOps():
+                        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                            self._stone_translate_ops[prim_path] = op
+                            op.Set(Gf.Vec3d(*HIDDEN_STONE_POS))
+                            break
+
+        # --- Per-frame readback verification (first 3 frames) ---
+        if self._frame_counter <= 3:
+            xform_cache = UsdGeom.XformCache()
+            print(f"\n--- Frame {self._frame_counter} readback ({len(self._frame_visible_objects)} visible, "
+                  f"{len(all_stones) - len(selected_stones)} hidden) ---")
+            for prim in all_stones:
+                name = prim.GetName()
+                imageable = UsdGeom.Imageable(prim)
+                vis = imageable.GetVisibilityAttr().Get()
+                computed_vis = imageable.ComputeVisibility()
+                world_xform = xform_cache.GetLocalToWorldTransform(prim)
+                wp = Gf.Vec3d(world_xform[3][0], world_xform[3][1], world_xform[3][2])
+                is_selected = prim in selected_stones
+                expected = "VISIBLE" if is_selected else "HIDDEN"
+                actual_vis = "visible" if vis == UsdGeom.Tokens.inherited else str(vis)
+                on_screen = abs(wp[0]) < 10000 and abs(wp[1]) < 10000
+                flag = ""
+                if is_selected and computed_vis == UsdGeom.Tokens.invisible:
+                    flag = " *** SHOULD BE VISIBLE BUT COMPUTED INVISIBLE ***"
+                elif not is_selected and computed_vis != UsdGeom.Tokens.invisible:
+                    flag = " *** SHOULD BE HIDDEN BUT COMPUTED VISIBLE ***"
+                elif not is_selected and on_screen:
+                    flag = " *** HIDDEN BUT STILL ON-SCREEN POSITION ***"
+                # Check children for stale invisible attrs
+                child_flags = ""
+                if is_selected:
+                    for child in Usd.PrimRange(prim):
+                        child_vis = UsdGeom.Imageable(child).GetVisibilityAttr().Get()
+                        if child_vis == UsdGeom.Tokens.invisible:
+                            child_flags += f" *** CHILD {child.GetName()} STILL INVISIBLE ***"
+                print(f"  {name}: expect={expected}, vis={actual_vis}, computedVis={computed_vis}, "
+                      f"worldPos=({wp[0]:.1f}, {wp[1]:.1f}, {wp[2]:.1f}){flag}{child_flags}")
+            print()
 
         # 4. Camera Pose: fixed position, pan only (look-at target varies)
         # Real camera is static overhead; pans primarily up/down the sheet (X),
@@ -712,12 +907,8 @@ class stoneUpdateExtension(omni.ext.IExt):
 
         return f"{class_id} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}"
 
-    def _write_yolo_labels(self, frame_index, visible_objects, cam_params):
-        """Write YOLO format labels by projecting known 3D object positions
-        through the camera.
-        Format: class_id center_x center_y width height (all normalized 0-1)"""
-        label_path = os.path.join(self._labels_dir, f"rgb_{frame_index:04d}.txt")
-
+    def _write_yolo_labels_to_path(self, label_path, visible_objects, cam_params):
+        """Write YOLO format labels to a specific file path."""
         lines = []
 
         # 1. Stones (positions tracked during randomization)
